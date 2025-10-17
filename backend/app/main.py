@@ -1,72 +1,106 @@
-"""FastAPI entrypoint wiring the ChatKit server and REST endpoints."""
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from typing import Optional, List
+import os, json, requests, logging
 
-from __future__ import annotations
+app = FastAPI(title="Property Matcher API", version="1.2.0")
 
-from typing import Any
+# ---------- Env ----------
+OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY", "")
+LISTINGS_AGENT_ID = os.getenv("LISTINGS_AGENT_ID", "")  # agt_* or wf_*
+PUBLIC_CALLER_KEY = os.getenv("PUBLIC_CALLER_KEY", "")
+OPENAI_BASE       = os.getenv("OPENAI_BASE", "https://api.openai.com/v1")
 
-from chatkit.server import StreamingResult
-from fastapi import Depends, FastAPI, HTTPException, Request, status
-from fastapi.responses import Response, StreamingResponse
-from starlette.responses import JSONResponse
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("propertymatcher")
 
-from .chat import (
-    FactAssistantServer,
-    create_chatkit_server,
-)
-from .facts import fact_store
+# ---------- Models ----------
+class Criteria(BaseModel):
+    location: Optional[str] = None
+    min_price: Optional[int] = None
+    max_price: Optional[int] = None
+    beds_min: Optional[int] = None
+    baths_min: Optional[int] = None
+    property_types: Optional[List[str]] = []
+    keywords: Optional[str] = None
 
-app = FastAPI(title="ChatKit API")
+class AgentRequest(BaseModel):
+    conversation_id: Optional[str] = "listing-run"
+    limit: Optional[int] = 8
+    criteria: Criteria
 
-_chatkit_server: FactAssistantServer | None = create_chatkit_server()
+# ---------- Helpers ----------
+def runs_url_for(identifier: str) -> str:
+    if identifier.startswith("wf_"):
+        return f"{OPENAI_BASE}/workflows/{identifier}/runs"
+    if identifier.startswith("agt_"):
+        return f"{OPENAI_BASE}/agents/{identifier}/runs"
+    # default: treat as agent id
+    return f"{OPENAI_BASE}/agents/{identifier}/runs"
 
+def require_env():
+    if not OPENAI_API_KEY:
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set")
+    if not LISTINGS_AGENT_ID:
+        raise HTTPException(status_code=500, detail="LISTINGS_AGENT_ID is not set")
 
-def get_chatkit_server() -> FactAssistantServer:
-    if _chatkit_server is None:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=(
-                "ChatKit dependencies are missing. Install the ChatKit Python "
-                "package to enable the conversational endpoint."
-            ),
-        )
-    return _chatkit_server
+# ---------- Routes ----------
+@app.get("/")
+def health():
+    return {"status": "ok", "service": "propertymatcher", "docs": "/docs"}
 
+@app.get("/debug/config")
+def debug_config():
+    # redacts secret but shows where we’ll call
+    url = runs_url_for(LISTINGS_AGENT_ID)
+    return {
+        "api_version": "1.2.0",
+        "id_prefix": LISTINGS_AGENT_ID[:3] if LISTINGS_AGENT_ID else None,
+        "openai_runs_url": url,
+        "has_openai_key": bool(OPENAI_API_KEY),
+    }
 
-@app.post("/chatkit")
-async def chatkit_endpoint(
-    request: Request, server: FactAssistantServer = Depends(get_chatkit_server)
-) -> Response:
-    payload = await request.body()
-    result = await server.process(payload, {"request": request})
-    if isinstance(result, StreamingResult):
-        return StreamingResponse(result, media_type="text/event-stream")
-    if hasattr(result, "json"):
-        return Response(content=result.json, media_type="application/json")
-    return JSONResponse(result)
+@app.post("/agent/listings")
+def run_listings_agent(payload: AgentRequest, request: Request):
+    if PUBLIC_CALLER_KEY:
+        provided = request.headers.get("x-api-key")
+        if not provided or provided != PUBLIC_CALLER_KEY:
+            raise HTTPException(status_code=401, detail="Invalid or missing x-api-key")
 
+    require_env()
 
-@app.get("/facts")
-async def list_facts() -> dict[str, Any]:
-    facts = await fact_store.list_saved()
-    return {"facts": [fact.as_dict() for fact in facts]}
+    query_text = (
+        f"Find up to {payload.limit} Québec listings based on: "
+        f"{json.dumps(payload.criteria.dict(), ensure_ascii=False)}"
+    )
 
+    url = runs_url_for(LISTINGS_AGENT_ID)
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+        "OpenAI-Beta": "agents=v1",
+    }
+    body = {
+        "input_as_text": query_text,
+        "input_variables": payload.criteria.dict(),
+    }
 
-@app.post("/facts/{fact_id}/save")
-async def save_fact(fact_id: str) -> dict[str, Any]:
-    fact = await fact_store.mark_saved(fact_id)
-    if fact is None:
-        raise HTTPException(status_code=404, detail="Fact not found")
-    return {"fact": fact.as_dict()}
+    log.info(f"Calling OpenAI runs endpoint: {url}")
 
+    try:
+        resp = requests.post(url, headers=headers, json=body, timeout=120)
+        if not resp.ok:
+            # return the exact OpenAI error body to the client for visibility
+            raise HTTPException(status_code=resp.status_code, detail=resp.text)
+        data = resp.json()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Agent request failed: {e}")
 
-@app.post("/facts/{fact_id}/discard")
-async def discard_fact(fact_id: str) -> dict[str, Any]:
-    fact = await fact_store.discard(fact_id)
-    if fact is None:
-        raise HTTPException(status_code=404, detail="Fact not found")
-    return {"fact": fact.as_dict()}
-
-
-@app.get("/health")
-async def health_check() -> dict[str, str]:
-    return {"status": "healthy"}
+    return JSONResponse({
+        "conversation_id": payload.conversation_id,
+        "criteria": payload.criteria.dict(),
+        "agent_output": data
+    })
