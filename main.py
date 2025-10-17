@@ -1,24 +1,28 @@
 from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-import os, requests, json
-from typing import Optional
+from typing import Optional, List
+import os, json, requests, logging
 
-app = FastAPI(title="Property Matcher API", version="1.0.0")
+app = FastAPI(title="Property Matcher API", version="1.2.0")
 
-# --- Environment Variables ---
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-SERPAPI_API_KEY = os.getenv("SERPAPI_API_KEY")
-PUBLIC_CALLER_KEY = os.getenv("PUBLIC_CALLER_KEY")
-USER_AGENT = os.getenv("USER_AGENT", "Mozilla/5.0 (PropertyMatcher)")
+# ---------- Env ----------
+OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY", "")
+LISTINGS_AGENT_ID = os.getenv("LISTINGS_AGENT_ID", "")  # agt_* or wf_*
+PUBLIC_CALLER_KEY = os.getenv("PUBLIC_CALLER_KEY", "")
+OPENAI_BASE       = os.getenv("OPENAI_BASE", "https://api.openai.com/v1")
 
-# --- Data models for validation ---
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("propertymatcher")
+
+# ---------- Models ----------
 class Criteria(BaseModel):
     location: Optional[str] = None
     min_price: Optional[int] = None
     max_price: Optional[int] = None
     beds_min: Optional[int] = None
     baths_min: Optional[int] = None
-    property_types: Optional[list[str]] = []
+    property_types: Optional[List[str]] = []
     keywords: Optional[str] = None
 
 class AgentRequest(BaseModel):
@@ -26,49 +30,76 @@ class AgentRequest(BaseModel):
     limit: Optional[int] = 8
     criteria: Criteria
 
-# --- Simple health check ---
+# ---------- Helpers ----------
+def runs_url_for(identifier: str) -> str:
+    if identifier.startswith("wf_"):
+        return f"{OPENAI_BASE}/workflows/{identifier}/runs"
+    if identifier.startswith("agt_"):
+        return f"{OPENAI_BASE}/agents/{identifier}/runs"
+    # default: treat as agent id
+    return f"{OPENAI_BASE}/agents/{identifier}/runs"
+
+def require_env():
+    if not OPENAI_API_KEY:
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set")
+    if not LISTINGS_AGENT_ID:
+        raise HTTPException(status_code=500, detail="LISTINGS_AGENT_ID is not set")
+
+# ---------- Routes ----------
 @app.get("/")
-async def root():
+def health():
     return {"status": "ok", "service": "propertymatcher", "docs": "/docs"}
 
-# --- Core listings endpoint ---
-@app.post("/agent/listings")
-async def get_listings(req: AgentRequest, request: Request):
-    # Optional API key validation
-    if PUBLIC_CALLER_KEY:
-        auth_key = request.headers.get("x-api-key")
-        if not auth_key or auth_key != PUBLIC_CALLER_KEY:
-            raise HTTPException(status_code=401, detail="Invalid API key")
+@app.get("/debug/config")
+def debug_config():
+    url = runs_url_for(LISTINGS_AGENT_ID) if LISTINGS_AGENT_ID else None
+    return {
+        "api_version": "1.2.0",
+        "id_prefix": LISTINGS_AGENT_ID[:3] if LISTINGS_AGENT_ID else None,
+        "openai_runs_url": url,
+        "has_openai_key": bool(OPENAI_API_KEY),
+    }
 
-    # Build query text for your OpenAI Agent
-    query = (
-        f"Find up to {req.limit} real estate listings based on: "
-        f"{json.dumps(req.criteria.dict(), ensure_ascii=False)}"
+@app.post("/agent/listings")
+def run_listings_agent(payload: AgentRequest, request: Request):
+    # optional shared secret header
+    if PUBLIC_CALLER_KEY:
+        provided = request.headers.get("x-api-key")
+        if not provided or provided != PUBLIC_CALLER_KEY:
+            raise HTTPException(status_code=401, detail="Invalid or missing x-api-key")
+
+    require_env()
+
+    query_text = (
+        f"Find up to {payload.limit} Québec listings based on: "
+        f"{json.dumps(payload.criteria.dict(), ensure_ascii=False)}"
     )
 
-    # Call your OpenAI Agent (replace wf_... with your agent ID)
-    openai_agent_id = os.getenv("LISTINGS_AGENT_ID", "wf_your_agent_id_here")
-    url = f"https://api.openai.com/v1/agents/{openai_agent_id}/runs"
-
+    url = runs_url_for(LISTINGS_AGENT_ID)
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
         "Content-Type": "application/json",
+        "OpenAI-Beta": "agents=v1",  # required for Agents/Workflows API
+    }
+    body = {
+        "input_as_text": query_text,
+        "input_variables": payload.criteria.dict(),
     }
 
-    body = {
-        "input_as_text": query,
-        "input_variables": req.criteria.dict(),
-    }
+    log.info(f"Calling OpenAI runs endpoint: {url}")
 
     try:
-        response = requests.post(url, headers=headers, json=body, timeout=120)
-        response.raise_for_status()
-        data = response.json()
+        resp = requests.post(url, headers=headers, json=body, timeout=120)
+        if not resp.ok:
+            raise HTTPException(status_code=resp.status_code, detail=resp.text)
+        data = resp.json()
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Agent request failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Agent request failed: {e}")
 
-    return {
-        "conversation_id": req.conversation_id,
-        "criteria": req.criteria.dict(),
-        "agent_output": data,
-    }
+    return JSONResponse({
+        "conversation_id": payload.conversation_id,
+        "criteria": payload.criteria.dict(),
+        "agent_output": data
+    })
